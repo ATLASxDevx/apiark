@@ -1,0 +1,459 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useActiveTab, useTabStore } from "@/stores/tab-store";
+import { AlertCircle, ClipboardCopy, Download, Check, ArrowLeftRight, BookmarkPlus } from "lucide-react";
+import { useDiffStore } from "@/stores/diff-store";
+import { EmptyState, RocketIcon } from "@/components/ui/empty-state";
+import { ResponseSkeleton } from "@/components/ui/skeleton";
+import { CodeGenerationPanel } from "./code-generation-panel";
+import { TestResultsPanel } from "./test-results-panel";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { readFullResponse } from "@/lib/tauri-api";
+import type { ConsoleEntry } from "@apiark/types";
+import { TimingPanel } from "./timing-panel";
+import { CodeEditor } from "@/components/ui/code-editor";
+import type { KeyValuePair } from "@apiark/types";
+
+type ResponseTab = "body" | "headers" | "cookies" | "tests" | "timing" | "console" | "code";
+
+function statusColor(status: number): string {
+  if (status < 200) return "text-blue-400";
+  if (status < 300) return "text-green-500";
+  if (status < 400) return "text-yellow-500";
+  if (status < 500) return "text-red-400";
+  return "text-red-500";
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function ResponsePanel() {
+  const { t } = useTranslation();
+  const tab = useActiveTab();
+  const [activeTab, setActiveTab] = useState<ResponseTab>("body");
+
+  if (!tab) return null;
+
+  const { response, error, loading, testResults, assertionResults, consoleOutput } = tab;
+
+  const hasTestResults = testResults.length > 0 || assertionResults.length > 0;
+  const failedCount = (testResults?.filter((t) => !t.passed).length ?? 0) +
+    (assertionResults?.filter((a) => !a.passed).length ?? 0);
+
+  // Loading state — skeleton shimmer
+  if (loading) {
+    return (
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <ResponseSkeleton />
+      </div>
+    );
+  }
+
+  // Error state
+  if (error) {
+    return (
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <ResponseTabs
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          response={null}
+          hasTestResults={hasTestResults}
+          failedCount={failedCount}
+          consoleCount={consoleOutput.length}
+        />
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center" role="alert">
+          <AlertCircle className="h-10 w-10 text-red-500" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-medium text-red-400">{error.message}</p>
+            {error.suggestion && (
+              <p className="mt-1 text-xs text-[var(--color-text-muted)]">{error.suggestion}</p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-1 flex-col overflow-hidden">
+      {/* Tabs — always on top */}
+      <ResponseTabs
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        response={response}
+        hasTestResults={hasTestResults}
+        failedCount={failedCount}
+        consoleCount={consoleOutput.length}
+      />
+
+      {/* Status bar — below tabs, always visible when response exists */}
+      {response && (
+        <div className="flex items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5" role="status" aria-live="polite">
+          <span className={`text-sm font-semibold animate-status-pulse ${statusColor(response.status)}`} aria-label={`Response: ${response.status} ${response.statusText}, ${response.status < 300 ? "success" : response.status < 400 ? "redirect" : response.status < 500 ? "client error" : "server error"}`}>
+            {response.status} {response.statusText}
+          </span>
+          <span className="text-xs text-[var(--color-text-muted)]">{response.timeMs}ms</span>
+          <span className="text-xs text-[var(--color-text-muted)]">
+            {formatSize(response.sizeBytes)}
+          </span>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!response && activeTab !== "code" && activeTab !== "tests" && activeTab !== "console" && (
+        <EmptyState
+          icon={<RocketIcon />}
+          title={t("response.noResponse")}
+          description="Use Ctrl+Enter to send quickly"
+        />
+      )}
+
+      {/* Content */}
+      {activeTab === "code" && <CodeGenerationPanel />}
+
+      {activeTab === "tests" && (
+        <div className="flex-1 overflow-auto p-3">
+          <TestResultsPanel
+            testResults={testResults}
+            assertionResults={assertionResults}
+          />
+        </div>
+      )}
+
+      {activeTab === "console" && (
+        <div className="flex-1 overflow-auto p-3">
+          <ConsolePanel entries={consoleOutput} />
+        </div>
+      )}
+
+      {response && (
+        <div className={`flex-1 animate-fade-in ${activeTab === "body" ? "flex min-h-0 flex-col p-3 pb-0" : "overflow-auto p-3"}`}>
+        {activeTab === "body" && (() => {
+          const language = getLanguageFromHeaders(response.headers);
+          const formattedBody = tryFormatBody(response.body, language);
+          return (
+            <>
+              <ResponseBodyActions body={formattedBody} />
+              {response.truncated && <TruncationBanner response={response} />}
+              <div className="min-h-0 flex-1">
+                <CodeEditor
+                  value={formattedBody}
+                  onChange={() => {}}
+                  language={language}
+                  height="100%"
+                  readOnly
+                  lineNumbers={false}
+                  minimap={false}
+                />
+              </div>
+            </>
+          );
+        })()}
+
+        {activeTab === "headers" && (
+          <table className="w-full text-sm">
+            <tbody>
+              {response.headers.map((h, i) => (
+                <tr key={i} className="border-b border-[var(--color-elevated)]">
+                  <td className="py-1 pr-4 font-medium text-[var(--color-text-secondary)]">
+                    {h.key}
+                  </td>
+                  <td className="py-1 text-[var(--color-text-primary)]">{h.value}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {activeTab === "cookies" && (
+          <>
+            {response.cookies.length === 0 ? (
+              <p className="text-sm text-[var(--color-text-dimmed)]">No cookies</p>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-[var(--color-text-muted)]">
+                    <th className="pb-1 pr-4">Name</th>
+                    <th className="pb-1 pr-4">Value</th>
+                    <th className="pb-1 pr-4">Domain</th>
+                    <th className="pb-1">Path</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {response.cookies.map((c, i) => (
+                    <tr key={i} className="border-b border-[var(--color-elevated)]">
+                      <td className="py-1 pr-4 font-medium text-[var(--color-text-secondary)]">
+                        {c.name}
+                      </td>
+                      <td className="py-1 pr-4 text-[var(--color-text-primary)]">{c.value}</td>
+                      <td className="py-1 pr-4 text-[var(--color-text-muted)]">
+                        {c.domain ?? "—"}
+                      </td>
+                      <td className="py-1 text-[var(--color-text-muted)]">{c.path ?? "/"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
+
+        {activeTab === "timing" && <TimingPanel response={response} />}
+      </div>
+      )}
+    </div>
+  );
+}
+
+function ResponseBodyActions({ body }: { body: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const tab = useActiveTab();
+  const { saveSnapshot, open: openDiff } = useDiffStore();
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      import("@/stores/toast-store").then(({ useToastStore }) =>
+        useToastStore.getState().showError("Failed to copy to clipboard"),
+      );
+    }
+  };
+
+  const handleSave = async () => {
+    try {
+      const filePath = await save({
+        filters: [
+          { name: "JSON", extensions: ["json"] },
+          { name: "XML", extensions: ["xml"] },
+          { name: "Text", extensions: ["txt"] },
+          { name: "All Files", extensions: ["*"] },
+        ],
+      });
+      if (filePath) {
+        await writeTextFile(filePath, body);
+      }
+    } catch (err) {
+      import("@/stores/toast-store").then(({ useToastStore }) =>
+        useToastStore.getState().showError(`Failed to save response: ${err}`),
+      );
+    }
+  };
+
+  return (
+    <div className="mb-2 flex gap-1">
+      <button
+        onClick={handleCopy}
+        className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-elevated)] hover:text-[var(--color-text-secondary)]"
+        title={t("response.copy")}
+      >
+        {copied ? <Check className="h-3 w-3 text-green-500" /> : <ClipboardCopy className="h-3 w-3" />}
+        {copied ? t("response.copied") : t("response.copy")}
+      </button>
+      <button
+        onClick={handleSave}
+        className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-elevated)] hover:text-[var(--color-text-secondary)]"
+        title={t("response.saveToFile")}
+      >
+        <Download className="h-3 w-3" />
+        {t("common.save")}
+      </button>
+      {tab?.response && (
+        <>
+          <button
+            onClick={() => {
+              if (tab.response) {
+                saveSnapshot(tab.name || "Response", tab.response);
+              }
+            }}
+            className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-elevated)] hover:text-[var(--color-text-secondary)]"
+            title={t("response.saveForDiff")}
+          >
+            <BookmarkPlus className="h-3 w-3" />
+            {t("response.saveForDiff")}
+          </button>
+          <button
+            onClick={openDiff}
+            className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-elevated)] hover:text-[var(--color-text-secondary)]"
+            title={t("response.compare")}
+          >
+            <ArrowLeftRight className="h-3 w-3" />
+            {t("response.compare")}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ResponseTabs({
+  activeTab,
+  setActiveTab,
+  response,
+  hasTestResults,
+  failedCount,
+  consoleCount,
+}: {
+  activeTab: ResponseTab;
+  setActiveTab: (tab: ResponseTab) => void;
+  response: { headers: { key: string; value: string }[]; cookies: { name: string }[] } | null;
+  hasTestResults: boolean;
+  failedCount: number;
+  consoleCount: number;
+}) {
+  const { t } = useTranslation();
+
+  const TAB_IDS: ResponseTab[] = ["body", "headers", "cookies", "tests", "timing", "console", "code"];
+  const TAB_LABEL_KEYS: Record<ResponseTab, string> = {
+    body: "response.body",
+    headers: "response.headers",
+    cookies: "response.cookies",
+    tests: "response.tests",
+    timing: "response.timing",
+    console: "response.console",
+    code: "response.code",
+  };
+
+  return (
+    <div className="flex gap-0 overflow-x-auto border-b border-[var(--color-border)] bg-[var(--color-surface)]">
+      {TAB_IDS.map((tabId) => (
+        <button
+          key={tabId}
+          onClick={() => setActiveTab(tabId)}
+          className={`shrink-0 whitespace-nowrap px-4 py-2 text-sm transition-colors ${
+            activeTab === tabId
+              ? "border-b-2 border-blue-500 text-[var(--color-text-primary)]"
+              : "text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)]"
+          }`}
+        >
+          {t(TAB_LABEL_KEYS[tabId])}
+          {tabId === "headers" && response && (
+            <span className="ml-1 text-xs text-[var(--color-text-dimmed)]">
+              ({response.headers.length})
+            </span>
+          )}
+          {tabId === "cookies" && response && response.cookies.length > 0 && (
+            <span className="ml-1 text-xs text-[var(--color-text-dimmed)]">
+              ({response.cookies.length})
+            </span>
+          )}
+          {tabId === "tests" && hasTestResults && (
+            <span className={`ml-1 text-xs ${failedCount > 0 ? "text-red-400" : "text-green-500"}`}>
+              {failedCount > 0 ? `${failedCount} fail` : "pass"}
+            </span>
+          )}
+          {tabId === "console" && consoleCount > 0 && (
+            <span className="ml-1 text-xs text-[var(--color-text-dimmed)]">
+              ({consoleCount})
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ConsolePanel({ entries }: { entries: ConsoleEntry[] }) {
+  if (entries.length === 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-dimmed)]">
+        No console output. Use <code className="rounded bg-[var(--color-elevated)] px-1">console.log()</code> in scripts.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-0.5 font-mono text-sm">
+      {entries.map((entry, i) => (
+        <div
+          key={i}
+          className={`rounded px-2 py-1 ${
+            entry.level === "error"
+              ? "bg-red-500/10 text-red-400"
+              : entry.level === "warn"
+                ? "bg-yellow-500/10 text-yellow-400"
+                : "text-[var(--color-text-primary)]"
+          }`}
+        >
+          <span className="mr-2 text-xs text-[var(--color-text-dimmed)]">
+            [{entry.level}]
+          </span>
+          {entry.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TruncationBanner({ response }: { response: { truncated?: boolean; fullSize?: number; tempPath?: string } }) {
+  const [loading, setLoading] = useState(false);
+  const tab = useActiveTab();
+
+  const handleLoadFull = async () => {
+    if (!response.tempPath || !tab) return;
+    setLoading(true);
+    try {
+      const fullBody = await readFullResponse(response.tempPath);
+      // Update the tab's response body in-place
+      useTabStore.getState().updateResponse(tab.id, { body: fullBody, truncated: false });
+    } catch (err) {
+      import("@/stores/toast-store").then(({ useToastStore }) =>
+        useToastStore.getState().showError(`Failed to load full response: ${err}`),
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="mb-2 flex items-center gap-2 rounded bg-yellow-500/10 px-3 py-2 text-xs text-yellow-400">
+      <span>
+        Response truncated (showing 1 MB of {formatSize(response.fullSize ?? 0)}).
+      </span>
+      {response.tempPath && (
+        <button
+          onClick={handleLoadFull}
+          disabled={loading}
+          className="rounded bg-yellow-500/20 px-2 py-0.5 font-medium hover:bg-yellow-500/30 disabled:opacity-50"
+        >
+          {loading ? "Loading..." : "Load Full Response"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function tryFormatBody(body: string, language: string): string {
+  if (language === "json") {
+    try {
+      return JSON.stringify(JSON.parse(body), null, 2);
+    } catch {
+      return body;
+    }
+  }
+  return body;
+}
+
+function getLanguageFromHeaders(headers: KeyValuePair[]): string {
+  const contentType = headers
+    .find((h) => h.key.toLowerCase() === "content-type")
+    ?.value?.toLowerCase()
+    .split(";")[0]
+    .trim();
+
+  if (!contentType) return "plaintext";
+  if (contentType.includes("json")) return "json";
+  if (contentType.includes("xml")) return "xml";
+  if (contentType.includes("html")) return "html";
+  if (contentType.includes("javascript")) return "javascript";
+  if (contentType.includes("css")) return "css";
+  if (contentType.includes("yaml") || contentType.includes("x-yaml")) return "yaml";
+  return "plaintext";
+}

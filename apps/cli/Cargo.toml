@@ -1,0 +1,26 @@
+[package]
+name = "apiark-cli"
+version = "0.2.1"
+description = "ApiArk CLI — run collections from the command line"
+authors = ["ApiArk Contributors"]
+edition = "2021"
+
+[[bin]]
+name = "apiark"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "cookies", "rustls-tls"] }
+url = "2"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+rand = "0.8"
+csv = "1"
+colored = "2"
